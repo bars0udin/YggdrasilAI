@@ -135,4 +135,15 @@ if [ -f "$BL_SVC" ] && [ -f "$BL_TMR" ]; then
     systemctl --global enable yggdrasil-baseline.timer >/dev/null 2>&1 || true
 fi
 
+# --- v1.5.6: GPU speech recognition on NVIDIA machines ----------------------------------------
+# Existing installs run Whisper base.en on CPU (the mishearing culprit). If there's a live NVIDIA
+# driver, install the CUDA libs + large-v3-turbo so STT moves to the GPU. Helper is idempotent and
+# no-ops on non-NVIDIA / already-installed; run BACKGROUNDED so "update yourself" doesn't hang on
+# a ~2GB download. Applies at the next assistant restart.
+GPU_SRC=/opt/yggdrasil/yggdrasil-iso/config/includes.chroot/usr/local/sbin/yggdrasil-gpu-stt
+if [ -f "$GPU_SRC" ]; then
+    install -m 755 "$GPU_SRC" /usr/local/sbin/yggdrasil-gpu-stt || true
+    setsid /usr/local/sbin/yggdrasil-gpu-stt >/dev/null 2>&1 &
+fi
+
 exit 0

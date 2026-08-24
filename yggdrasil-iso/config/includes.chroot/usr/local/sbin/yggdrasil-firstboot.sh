@@ -110,6 +110,13 @@ if [ "$VENDOR" = nvidia ] && ! nvidia_works; then
     fi
 fi
 
+# --- GPU speech recognition (NVIDIA only). Baked STT is CPU base.en; if the driver is live, add
+#     the CUDA libs + large-v3-turbo in the BACKGROUND so first-boot isn't held on a ~2GB download.
+#     No-ops on AMD/Intel/CPU. Applies at the next assistant start. ---
+if [ -x /usr/local/sbin/yggdrasil-gpu-stt ]; then
+    setsid /usr/local/sbin/yggdrasil-gpu-stt >/dev/null 2>&1 &
+fi
+
 # --- choose a model by VRAM (mirror of MODEL_TIERS) ---
 VRAM=0
 if command -v nvidia-smi >/dev/null 2>&1; then

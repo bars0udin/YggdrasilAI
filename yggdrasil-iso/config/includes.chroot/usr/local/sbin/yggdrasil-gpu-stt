@@ -1,0 +1,44 @@
+#!/bin/sh
+# GPU speech recognition on NVIDIA machines.
+#
+# The ISO bakes only Whisper base.en (CPU, English-only) to stay hardware-neutral. On a machine
+# with a working NVIDIA driver, faster-whisper can run large-v3-turbo on the GPU instead — far
+# more accurate (fixes most of the "Jarvis" -> "Drawers" mishearing) and multilingual. That needs
+# two CUDA runtime libraries that are NVIDIA-only and ~1GB, so they're not baked in; this installs
+# them into the app venv on demand and pre-fetches the model.
+#
+# ctranslate2 4.x wants cuDNN 9 + cuBLAS from CUDA 12; the nvidia-cublas-cu12 / nvidia-cudnn-cu12
+# wheels provide exactly the nvidia.cublas / nvidia.cudnn modules the `jarvis` launcher puts on
+# LD_LIBRARY_PATH. The upgrade applies at the NEXT assistant restart.
+#
+# Idempotent, NVIDIA-only, non-fatal by design: STT already falls back to CPU base.en if anything
+# here is missing or mismatched, so a failure here can NEVER break speech. Safe to run anywhere —
+# it no-ops without a live NVIDIA driver, and exits immediately if the libs are already present.
+set -u
+VENV=/opt/yggdrasil/venv
+PY="$VENV/bin/python"
+PIP="$VENV/bin/pip"
+LOG=/var/lib/yggdrasil/gpu-stt.log
+[ -x "$PIP" ] || exit 0
+
+# Only on a machine whose NVIDIA driver is actually live (compute-capable).
+nvidia-smi --query-gpu=memory.total --format=csv,noheader >/dev/null 2>&1 || exit 0
+# Already installed? (the launcher looks for exactly these two modules)
+"$PY" -c 'import nvidia.cublas, nvidia.cudnn' >/dev/null 2>&1 && exit 0
+
+mkdir -p /var/lib/yggdrasil
+{
+    echo "[$(date)] installing CUDA libs for GPU speech recognition…"
+    if ! "$PIP" install --no-cache-dir nvidia-cublas-cu12 "nvidia-cudnn-cu12<10"; then
+        echo "[$(date)] lib install failed (no network?) — staying on CPU base.en"
+        exit 0
+    fi
+    # Pre-fetch large-v3-turbo so the first spoken command isn't a silent multi-hundred-MB wait.
+    NV=$("$PY" -c "import nvidia.cublas as a, nvidia.cudnn as b, os; print(os.path.join(list(a.__path__)[0],'lib')+':'+os.path.join(list(b.__path__)[0],'lib'))" 2>/dev/null)
+    if LD_LIBRARY_PATH="$NV${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$PY" -c "from faster_whisper.utils import download_model; download_model('large-v3-turbo')"; then
+        echo "[$(date)] done — GPU speech recognition ready; it applies at the next restart."
+    else
+        echo "[$(date)] libs installed; model will download on first use."
+    fi
+} >> "$LOG" 2>&1
