@@ -24,6 +24,7 @@ from .agents.software_agent import SoftwareAgent
 from .agents.system_agent import SystemAgent
 from .agents.vision_agent import VisionAgent
 from .agents.task_agent import TaskAgent
+from .agents.mail_agent import MailAgent
 from .agents.update_agent import UpdateAgent
 from .agents.voice_agent import VoiceAgent
 from .agents.writer_agent import WriterAgent
@@ -85,6 +86,7 @@ async def build_orchestrator(channel: UserChannel, auth_resolver: AuthResolver):
     market = MarketAgent(bus, perms, llm)
     registry.register(market)
     registry.register(UpdateAgent(bus, perms, llm))
+    registry.register(MailAgent(bus, perms))
     registry.register(ModelAgent(bus, perms, models))
     registry.register(VoiceAgent(bus, perms))
     registry.register(DevAgent(bus, perms,
