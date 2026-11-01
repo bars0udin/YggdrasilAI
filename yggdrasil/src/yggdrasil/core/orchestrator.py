@@ -919,6 +919,80 @@ _TERMINAL_CLOSE_RE = re.compile(
     r"\s*[.?!]*\s*$", re.I)
 
 
+# MAIL — read the inbox through Thunderbird (agents/mail_agent.py). Deterministic because the
+# planner reliably got this wrong on small models: "open my mail and read my first message" came
+# back as app.launch(mail) ×3, and "read my first email" as a web search for "first email".
+# Checked BEFORE the browser routes, which would otherwise take "open the first email" as a link
+# and "read it" as the web page.
+_MAIL_NOUN = r"(?:e-?mails?|mail|inbox|thunderbird|gmail)"
+_MAIL_CTX_RE = re.compile(rf"\b{_MAIL_NOUN}\b"
+                          r"|\bmy\s+(?:\w+\s+){0,2}messages?\b"
+                          r"|\b(?:next|previous|unread|new)\s+messages?\b", re.I)
+_MAIL_COMPOSE_RE = re.compile(r"\b(?:send|write|compose|draft|reply|respond|forward|delete|"
+                              r"archive|set up|setup|configure|add (?:an? )?account)\b", re.I)
+_MAIL_READ_RE = re.compile(r"\b(?:read|what(?:'s| is| does| did)|tell me|say|who (?:sent|emailed)|"
+                           r"go through|play)\b", re.I)
+_MAIL_LIST_RE = re.compile(r"\b(?:any (?:new )?(?:e-?mails?|mail|messages)|new (?:e-?mails?|mail|messages)|"
+                           r"how many|check|list|summar\w*|unread (?:e-?mails?|mail|messages)|"
+                           r"what(?:'s| is) in my inbox|got (?:any )?mail)\b", re.I)
+_MAIL_OPEN_RE = re.compile(r"\b(?:open|launch|start|show|bring up|pull up|go to|switch to)\b", re.I)
+_MAIL_SPECIFIC_RE = re.compile(r"\b(?:first|second|third|fourth|fifth|1st|2nd|3rd|\d+(?:st|nd|rd|th)?|"
+                               r"latest|newest|last|top|most recent|next|previous|from)\b", re.I)
+# Short follow-ups that only make sense right after a mail exchange ("next", "open it").
+_MAIL_FOLLOW_RE = re.compile(
+    r"^\s*(?:(?:and |ok(?:ay)?,? |now )?(?:read |play |go to )?(?:me )?(?:the )?"
+    r"(?P<nav>next|previous)(?: one| email| message)?|(?:read (?:it|that) )?again"
+    r"|(?:open|show)(?: me)? (?:it|that|this)(?: one| email| message)?(?: in thunderbird)?"
+    r"|(?:read )?(?:the )?(?P<ord>first|second|third|fourth|fifth|\d+(?:st|nd|rd|th)?) one)"
+    r"\s*(?:please)?[.?!]*\s*$", re.I)
+
+
+def _mail_arg(gl: str) -> str:
+    m = re.search(r"\bfrom\s+(.+?)(?:\s+(?:and|then|please)\b.*)?$", gl)
+    if m and not re.match(r"(?:today|yesterday|this|last|the last)\b", m.group(1)):
+        return "from:" + m.group(1).strip(" .?!")
+    for w in ("next", "previous"):
+        if re.search(rf"\b{w}\b", gl):
+            return w
+    unread = re.search(r"\b(?:unread|new)\b", gl)
+    m = re.search(r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
+                  r"\d+(?:st|nd|rd|th)?|latest|newest|last|top|most recent)\b", gl)
+    ordw = m.group(1) if m else "first"
+    ordw = re.sub(r"(?<=\d)(?:st|nd|rd|th)$", "", ordw)
+    return f"{ordw} unread" if unread else ordw
+
+
+def _mail_route(goal: str, follow_up: bool = False):
+    """(verb, params) for a mail request, or None. ``follow_up`` = the last exchange was mail, so
+    bare "next" / "open it" / "the second one" belong to it."""
+    gl = goal.strip().lower().rstrip(".?!")
+    gl = re.sub(r"^(?:can you |could you |would you |please |hey |ok(?:ay)?,? )+", "", gl)
+    if follow_up:
+        m = _MAIL_FOLLOW_RE.match(gl)
+        if m:
+            if m.group("nav"):
+                return ("read", {"argument": m.group("nav").lower()})
+            if m.group("ord"):
+                return ("read", {"argument": m.group("ord").lower() + " one"})
+            if gl.startswith(("open", "show")):
+                return ("open", {"argument": "current"})
+            return ("read", {"argument": "again"})
+    if not _MAIL_CTX_RE.search(gl) or _MAIL_COMPOSE_RE.search(gl):
+        return None
+    wants_open = bool(_MAIL_OPEN_RE.search(gl))
+    if _MAIL_READ_RE.search(gl):
+        return ("read", {"argument": _mail_arg(gl), "show": wants_open})
+    if _MAIL_LIST_RE.search(gl):
+        return ("list", {"argument": "unread"})
+    if wants_open:
+        # "open my first email" = show + read that message; "open my mail" = just the app.
+        if _MAIL_SPECIFIC_RE.search(gl) and re.search(r"\b(?:e-?mail|message)s?\b", gl) \
+                and not re.search(r"\bmy (?:e-?)?mail\s*$", gl):
+            return ("read", {"argument": _mail_arg(gl), "show": True})
+        return ("open", {"argument": ""})
+    return None
+
+
 # CLI-synthesis rung -> the Task agent. Explicit, unambiguous lead-ins ("use the terminal to X",
 # "figure out how to X") so it never hijacks ordinary requests; the planner can also route here.
 _TASK_TRIGGER = re.compile(
@@ -1035,6 +1109,7 @@ class Orchestrator:
         # refer to, and "repeat that" can re-speak the last reply verbatim.
         self._dialogue: deque[tuple[str, str]] = deque(maxlen=6)
         self._help_commands: list[dict] = []  # numbered commands from the last "help" card ("do number 3")
+        self._mail_at = -1e9  # when the last mail exchange happened — "next" / "open it" follow it
 
     def _publish(self, text: str) -> None:
         # Show WHAT I HEARD alongside what I'm doing, so a wrong transcript (the usual cause of
@@ -1123,6 +1198,7 @@ class Orchestrator:
         if stripped and stripped != goal.strip():
             addressed = True
             goal = stripped
+        raw_goal = goal  # before pronoun rewriting: "open it" right after an email means the email
         goal = self._rewrite_pronouns(goal)
         if _DANGER_RE.search(goal):  # catastrophic intent -> hard refusal, never reaches the model
             self._publish("")
@@ -1212,6 +1288,14 @@ class Orchestrator:
                 reply += (" I've also put my voices on screen — if you'd like me to sound "
                           "different too, preview one and say, for example, “use the Ryan voice”.")
             return reply
+        ml = _mail_route(raw_goal, follow_up=_time.monotonic() - self._mail_at < 300)
+        if ml:  # "open my mail and read my first message" / "next" / "any new mail?"
+            verb, prms = ml
+            self._publish("Mail…")
+            task = Task(action=f"mail.{verb}", agent="mail", params=prms)
+            result = await self._dispatch(task)
+            self._mail_at = _time.monotonic() if result.status is Status.OK else -1e9
+            return self._render(task, result)
         mkt = _market_route(goal)  # "install the X agent" / "what agents are available" / "yes install it"
         if mkt:
             verb, arg = mkt
@@ -1424,6 +1508,10 @@ class Orchestrator:
             trace.record(trace.Decision(goal=goal, active=active, memory_used=bool(ctx),
                                         route="conversation", outcome=reply))
             return reply
+        # Small planners stutter: "open my mail and read…" came back as app.launch(mail) three
+        # times. Running the same step back-to-back is never what was meant — collapse repeats.
+        tasks = [t for i, t in enumerate(tasks)
+                 if i == 0 or (t.action, t.params) != (tasks[i - 1].action, tasks[i - 1].params)]
         replies, steps, ok, any_ok, denied = [], [], True, False, False
         for task in tasks:
             self._resolve_pronoun(task)
